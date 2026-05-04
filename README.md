@@ -47,6 +47,9 @@ env SUBFINDER_VERSION=@v2.6.0 NUCLEI_VERSION=@v3.2.0 ./setup-recon.sh
 - `--deep` Increase depth/threading for broader coverage
 - `--verbose` Show stderr from tools (debug mode)
 - `--sequential` Run URL collection/crawling phases sequentially (lower request burst)
+- `--config FILE` Load shared JSON config (rate limits, depths, keyword regex, ports)
+- `--dry-run` Validate arguments and tools, then print planned execution without recon network phases
+- `--json` Write machine-readable `summary.json` for CI parsing
 - `--version` Print script version
 - `--help` Show help
 
@@ -57,7 +60,31 @@ env SUBFINDER_VERSION=@v2.6.0 NUCLEI_VERSION=@v3.2.0 ./setup-recon.sh
 ./recon.sh --no-nuclei example.com
 ./recon.sh --fast example.com
 ./recon.sh --deep example.com
+./recon.sh --config team-config.json --json example.com
+./recon.sh --dry-run --config team-config.json example.com
 ```
+
+### Config File Example
+
+```json
+{
+  "httpx_threads": 40,
+  "httpx_rate": 120,
+  "katana_depth": 3,
+  "katana_concurrency": 8,
+  "hakrawler_depth": 3,
+  "hakrawler_xargs_parallel": 4,
+  "gau_threads": 5,
+  "nmap_timing": 3,
+  "tool_timeout_seconds": 300,
+  "nmap_ports": "80,443,8080,8443",
+  "interesting_keywords": "api|admin|login|auth|debug|token|config"
+}
+```
+
+Config notes:
+- Integer fields in config (threads/rates/depth/concurrency/timing/timeout) must be positive integers; invalid values are ignored with a warning.
+- `--fast` / `--deep` are applied after config load, so those mode flags override overlapping config values.
 
 ## Requirements
 
@@ -103,8 +130,10 @@ export PATH="$PATH:$HOME/go/bin"
    - parallel by default: `gau`, `katana`, `hakrawler`
    - sequential if `--sequential` is passed
 5. URL analysis (all URLs, params, interesting endpoints, JS URLs)
-6. Optional nuclei scan (safe/default tags only)
-7. Summary report generation
+6. JavaScript download and analysis (`js_downloads`, `js_endpoints.txt`, `js_keywords.txt`)
+7. Focused hunting output generation (`focused/*.txt`, priority/checklist files)
+8. Optional nuclei scan (safe/default tags only)
+9. Summary report generation
 
 ## Output
 
@@ -127,8 +156,23 @@ With files:
 - `interesting.txt` URLs matching keywords (`api`, `admin`, `login`, etc.)
 - `js.txt` JavaScript URL candidates (`.js`)
 - `js_live.txt` Live JavaScript URLs (filtered via `httpx`)
+- `js_downloads/` Downloaded live JavaScript files
+- `js_endpoints.txt` Endpoint-like paths extracted from JavaScript
+- `js_keywords.txt` Security-relevant JS keyword matches with file/line context
+- `focused/auth.txt` Auth-related high-signal lines
+- `focused/api.txt` API-related high-signal lines
+- `focused/idor.txt` IDOR/multi-tenant identifier high-signal lines
+- `focused/redirects.txt` Redirect/callback high-signal lines
+- `focused/uploads.txt` Upload/download/import/export high-signal lines
+- `focused/tokens-secrets.txt` Token/secret-related high-signal lines
+- `focused/admin-debug.txt` Admin/debug/internal high-signal lines
+- `focused/graphql.txt` GraphQL-related high-signal lines
+- `focused/js-high-signal.txt` High-signal JS keyword lines
+- `findings-priority.txt` Suggested priority hunting order and themes
+- `manual-hunt-checklist.txt` Manual bug-hunting checklist
 - `nuclei.txt` Nuclei findings (if enabled)
 - `summary.txt` Final run summary
+- `summary.json` Machine-readable summary (written when `--json` is passed)
 - `recon.log` Full run log
 
 ## Safety and Scope Notes
@@ -151,6 +195,7 @@ With files:
 - Default mode runs `gau`, `katana`, and `hakrawler` in parallel for speed.
 - Use `--sequential` if a target is sensitive to request bursts/rate limits.
 - `--verbose` reveals tool stderr; default mode suppresses noisy stderr while keeping phase-level warnings.
+- Progress output auto-adjusts bar width to terminal size (with safe min/max bounds) for cleaner display in split panes and CI logs.
 
 ## Authorization Reminder
 
