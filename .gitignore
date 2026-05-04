@@ -1,3 +1,5 @@
 recon-*/
 *.log
 .DS_Store
+.env
+*.txt

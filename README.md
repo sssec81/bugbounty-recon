@@ -12,6 +12,28 @@ This script is designed to:
 
 It does **not** perform brute force, exploitation, or destructive actions.
 
+## Quick Start
+
+```bash
+./setup-recon.sh
+# open a new terminal (or source your rc file)
+./recon.sh --help
+./recon.sh --fast example.com
+```
+
+## Setup Options
+
+```bash
+# Default (latest tool versions)
+./setup-recon.sh
+
+# Pin specific versions (with or without '@')
+NUCLEI_VERSION=v3.2.0 HTTPX_VERSION=@v1.3.5 ./setup-recon.sh
+
+# CI-style reproducible setup
+env SUBFINDER_VERSION=@v2.6.0 NUCLEI_VERSION=@v3.2.0 ./setup-recon.sh
+```
+
 ## Usage
 
 ```bash
@@ -23,6 +45,9 @@ It does **not** perform brute force, exploitation, or destructive actions.
 - `--no-nuclei` Skip nuclei scanning
 - `--fast` Lower depth/threading for quicker runs
 - `--deep` Increase depth/threading for broader coverage
+- `--verbose` Show stderr from tools (debug mode)
+- `--sequential` Run URL collection/crawling phases sequentially (lower request burst)
+- `--version` Print script version
 - `--help` Show help
 
 ### Examples
@@ -74,12 +99,12 @@ export PATH="$PATH:$HOME/go/bin"
 1. Subdomain enumeration (`subfinder`, `assetfinder`)
 2. Live host probing (`httpx`)
 3. Port scan (`nmap`, conservative common web ports)
-4. Historical URL collection (`gau`)
-5. Crawling (`katana`)
-6. Crawling (`hakrawler`)
-7. URL analysis (all URLs, params, interesting endpoints, JS URLs)
-8. Optional nuclei scan (safe/default tags only)
-9. Summary report generation
+4. URL collection/crawling:
+   - parallel by default: `gau`, `katana`, `hakrawler`
+   - sequential if `--sequential` is passed
+5. URL analysis (all URLs, params, interesting endpoints, JS URLs)
+6. Optional nuclei scan (safe/default tags only)
+7. Summary report generation
 
 ## Output
 
@@ -101,6 +126,7 @@ With files:
 - `params.txt` URLs containing query strings
 - `interesting.txt` URLs matching keywords (`api`, `admin`, `login`, etc.)
 - `js.txt` JavaScript URL candidates (`.js`)
+- `js_live.txt` Live JavaScript URLs (filtered via `httpx`)
 - `nuclei.txt` Nuclei findings (if enabled)
 - `summary.txt` Final run summary
 - `recon.log` Full run log
@@ -119,6 +145,12 @@ With files:
 - On Linux, `timeout` is used if available.
 - On macOS, `gtimeout` (from `coreutils`) is used if available.
 - If neither exists, the script still runs but without timeout enforcement.
+
+## Parallel and Verbose Notes
+
+- Default mode runs `gau`, `katana`, and `hakrawler` in parallel for speed.
+- Use `--sequential` if a target is sensitive to request bursts/rate limits.
+- `--verbose` reveals tool stderr; default mode suppresses noisy stderr while keeping phase-level warnings.
 
 ## Authorization Reminder
 

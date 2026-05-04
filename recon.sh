@@ -8,6 +8,8 @@
 # =============================================================================
 
 set -euo pipefail
+SCRIPT_VERSION="1.1.0"
+trap 'log_error "Script failed at line $LINENO"; exit 1' ERR
 
 # =============================================================================
 # SECTION 1: COLORS & FORMATTING
@@ -53,6 +55,8 @@ log_skip()    { echo -e "${DIM}  [-] SKIP: $1${RESET}"; }
 RUN_NUCLEI=true
 FAST_MODE=false
 DEEP_MODE=false
+VERBOSE=false
+SEQUENTIAL_MODE=false
 TARGET=""
 
 # Rate limit defaults (requests per second / thread counts)
@@ -63,6 +67,7 @@ KATANA_CONCURRENCY=10
 HAKRAWLER_DEPTH=3
 GAU_THREADS=5
 NMAP_TIMING=3   # T3 = normal, not aggressive
+NMAP_PORTS="80,81,443,800,8000,8008,8080,8081,8443,8888,9000,9090,3000,4000,5000,6379,27017"
 TOOL_TIMEOUT_SECONDS=300
 
 # Interesting endpoint keywords to grep for
@@ -79,6 +84,9 @@ usage() {
   echo "  --no-nuclei   Skip nuclei vulnerability scanning"
   echo "  --fast        Reduce thread counts and skip deep crawls"
   echo "  --deep        Increase crawl depth, more thorough enumeration"
+  echo "  --verbose     Show tool stderr for debugging"
+  echo "  --sequential  Run gau/katana/hakrawler sequentially (lower request burst)"
+  echo "  --version     Show script version"
   echo "  --help        Show this help message"
   echo ""
   echo -e "${BOLD}EXAMPLES${RESET}"
@@ -105,9 +113,12 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --help|-h)      usage ;;
+      --version|-v)   echo "recon.sh version ${SCRIPT_VERSION}"; exit 0 ;;
       --no-nuclei)    RUN_NUCLEI=false; shift ;;
       --fast)         FAST_MODE=true; shift ;;
       --deep)         DEEP_MODE=true; shift ;;
+      --verbose|-V)   VERBOSE=true; shift ;;
+      --sequential)   SEQUENTIAL_MODE=true; shift ;;
       --*)            log_error "Unknown flag: $1"; usage ;;
       *)
         if [[ -z "$TARGET" ]]; then
@@ -208,6 +219,7 @@ ALL_URLS=""
 PARAMS_FILE=""
 INTERESTING_FILE=""
 JS_FILE=""
+JS_LIVE_FILE=""
 NUCLEI_FILE=""
 SUMMARY_FILE=""
 LOG_FILE=""
@@ -243,8 +255,29 @@ run_with_timeout() {
   fi
 }
 
+stderr_silence() {
+  # Bash-specific note: this helper is used via process substitution (2> >(stderr_silence)).
+  # Bash runs that substitution in a subshell and keeps this function available there.
+  if [[ "$VERBOSE" == true ]]; then
+    cat
+  else
+    cat >/dev/null
+  fi
+}
+
 cleanup_temp_files() {
   rm -f "$TEMP_SUBFINDER_OUT" "$TEMP_ASSETFINDER_OUT"
+}
+
+prepare_live_urls() {
+  local live_urls="$OUTPUT_DIR/live_urls_only.txt"
+
+  if [[ ! -s "$LIVE_FILE" ]]; then
+    touch "$live_urls"
+    return
+  fi
+
+  grep -oE 'https?://[^ ]+' "$LIVE_FILE" | awk '{print $1}' | sort -u > "$live_urls" || true
 }
 
 # =============================================================================
@@ -286,7 +319,7 @@ phase_subdomains() {
 
   # --- subfinder ---
   log_info "Running subfinder..."
-  if subfinder -d "$TARGET" -silent -o "$TEMP_SUBFINDER_OUT" 2>/dev/null; then
+  if subfinder -d "$TARGET" -silent -o "$TEMP_SUBFINDER_OUT" 2> >(stderr_silence); then
     cat "$TEMP_SUBFINDER_OUT" >> "$SUBS_RAW"
     log_success "subfinder: $(wc -l < "$TEMP_SUBFINDER_OUT" | tr -d ' ') subdomains found"
   else
@@ -295,7 +328,7 @@ phase_subdomains() {
 
   # --- assetfinder ---
   log_info "Running assetfinder..."
-  if assetfinder --subs-only "$TARGET" 2>/dev/null > "$TEMP_ASSETFINDER_OUT"; then
+  if assetfinder --subs-only "$TARGET" > "$TEMP_ASSETFINDER_OUT" 2> >(stderr_silence); then
     cat "$TEMP_ASSETFINDER_OUT" >> "$SUBS_RAW"
     log_success "assetfinder: $(wc -l < "$TEMP_ASSETFINDER_OUT" | tr -d ' ') subdomains found"
   else
@@ -336,7 +369,7 @@ phase_live_hosts() {
     -status-code \
     -title \
     -tech-detect \
-    -o "$LIVE_FILE" 2>/dev/null; then
+    -o "$LIVE_FILE" 2> >(stderr_silence); then
     local count
     count=$(wc -l < "$LIVE_FILE" | tr -d ' ')
     log_success "Live hosts found: ${BOLD}$count${RESET}"
@@ -365,6 +398,12 @@ phase_port_scan() {
   host_count=$(wc -l < "$hosts_file" | tr -d ' ')
   log_info "Scanning $host_count hosts with nmap (timing: T${NMAP_TIMING})..."
 
+  if [[ "$host_count" -eq 0 ]]; then
+    log_warn "No hosts extracted for nmap, skipping."
+    touch "$PORTS_FILE"
+    return
+  fi
+
   # Common web-relevant ports only — not a full port sweep
   # -Pn: skip host discovery (already confirmed live via httpx)
   # --open: show only open ports
@@ -373,9 +412,9 @@ phase_port_scan() {
     -T"$NMAP_TIMING" \
     -Pn \
     --open \
-    -p 80,81,443,800,8000,8008,8080,8081,8443,8888,9000,9090,3000,4000,5000,6379,27017 \
+    -p "$NMAP_PORTS" \
     -iL "$hosts_file" \
-    -oN "$PORTS_FILE" 2>/dev/null; then
+    -oN "$PORTS_FILE" 2> >(stderr_silence); then
     log_success "Port scan complete. Results saved to ports.txt"
   else
     log_warn "nmap encountered an error. Continuing..."
@@ -396,7 +435,7 @@ phase_gau() {
     --subs \
     --providers wayback,commoncrawl,otx \
     "$TARGET" \
-    > "$URLS_GAU" 2>/dev/null; then
+    > "$URLS_GAU" 2> >(stderr_silence); then
     local count
     count=$(wc -l < "$URLS_GAU" | tr -d ' ')
     log_success "gau URLs collected: ${BOLD}$count${RESET}"
@@ -419,9 +458,7 @@ phase_katana() {
     return
   fi
 
-  # Extract URLs from live.txt for katana input
   local live_urls="$OUTPUT_DIR/live_urls_only.txt"
-  grep -oE 'https?://[^ ]+' "$LIVE_FILE" | awk '{print $1}' | sort -u > "$live_urls" || true
 
   log_info "Running katana (depth: $KATANA_DEPTH, concurrency: $KATANA_CONCURRENCY, timeout: ${TOOL_TIMEOUT_SECONDS}s)..."
   if run_with_timeout "$TOOL_TIMEOUT_SECONDS" katana \
@@ -431,7 +468,7 @@ phase_katana() {
     -rate-limit 50 \
     -silent \
     -no-color \
-    -o "$URLS_KATANA" 2>/dev/null; then
+    -o "$URLS_KATANA" 2> >(stderr_silence); then
     local count
     count=$(wc -l < "$URLS_KATANA" | tr -d ' ')
     log_success "katana URLs crawled: ${BOLD}$count${RESET}"
@@ -455,14 +492,23 @@ phase_hakrawler() {
   fi
 
   local live_urls="$OUTPUT_DIR/live_urls_only.txt"
+  local hakrawler_targets="$OUTPUT_DIR/hakrawler_targets.txt"
+  grep -oE 'https?://[^/]+' "$live_urls" | sed -E 's|https?://||' | sort -u > "$hakrawler_targets" || true
+
+  if [[ ! -s "$hakrawler_targets" ]]; then
+    log_warn "No hakrawler targets extracted, skipping hakrawler crawl."
+    touch "$URLS_HAKRAWLER"
+    return
+  fi
 
   log_info "Running hakrawler (depth: $HAKRAWLER_DEPTH, timeout: ${TOOL_TIMEOUT_SECONDS}s)..."
-  # hakrawler reads from stdin; feed the live URLs list directly
-  if run_with_timeout "$TOOL_TIMEOUT_SECONDS" hakrawler \
+  # Feed hostnames to hakrawler to avoid URL-format ambiguity across versions.
+  if run_with_timeout "$TOOL_TIMEOUT_SECONDS" xargs -I{} hakrawler \
     -d "$HAKRAWLER_DEPTH" \
     -subs \
-    < "$live_urls" \
-    > "$URLS_HAKRAWLER" 2>/dev/null; then
+    "{}" \
+    < "$hakrawler_targets" \
+    > "$URLS_HAKRAWLER" 2> >(stderr_silence); then
     local count
     count=$(wc -l < "$URLS_HAKRAWLER" | tr -d ' ')
     log_success "hakrawler URLs crawled: ${BOLD}$count${RESET}"
@@ -480,6 +526,9 @@ phase_url_analysis() {
   log_phase "Phase 7 — URL Deduplication & Analysis"
 
   # Combine all URL sources
+  # Note: For very large target datasets, consider:
+  # sort -u -m "$URLS_GAU" "$URLS_KATANA" "$URLS_HAKRAWLER" > "$ALL_URLS"
+  # when each input file is guaranteed to be pre-sorted.
   log_info "Combining URLs from gau, katana, hakrawler..."
   cat "$URLS_GAU" "$URLS_KATANA" "$URLS_HAKRAWLER" 2>/dev/null | sort -u > "$ALL_URLS"
   local total
@@ -506,6 +555,21 @@ phase_url_analysis() {
   local js_count
   js_count=$(wc -l < "$JS_FILE" | tr -d ' ')
   log_success "JavaScript files found: ${BOLD}$js_count${RESET}"
+
+  # --- Extract live JavaScript URLs ---
+  if [[ -s "$JS_FILE" ]]; then
+    log_info "Filtering live JavaScript URLs with httpx..."
+    if httpx -l "$JS_FILE" -silent > "$JS_LIVE_FILE" 2> >(stderr_silence); then
+      local js_live_count
+      js_live_count=$(wc -l < "$JS_LIVE_FILE" | tr -d ' ')
+      log_success "Live JavaScript URLs: ${BOLD}$js_live_count${RESET}"
+    else
+      log_warn "httpx JS live filtering encountered an issue. Continuing..."
+      touch "$JS_LIVE_FILE"
+    fi
+  else
+    touch "$JS_LIVE_FILE"
+  fi
 }
 
 # =============================================================================
@@ -547,7 +611,7 @@ phase_nuclei() {
     -concurrency 5 \
     -silent \
     -no-color \
-    -o "$NUCLEI_FILE" 2>/dev/null; then
+    -o "$NUCLEI_FILE" 2> >(stderr_silence); then
     local count
     count=$(wc -l < "$NUCLEI_FILE" | tr -d ' ')
     log_success "Nuclei findings: ${BOLD}$count${RESET}"
@@ -564,13 +628,14 @@ phase_nuclei() {
 phase_summary() {
   log_phase "Recon Complete — Summary"
 
-  local subs_count live_count total_urls params_count js_count nuclei_count
+  local subs_count live_count total_urls params_count js_count js_live_count nuclei_count
 
   subs_count=$(wc -l < "$SUBS_FILE"       2>/dev/null | tr -d ' ' || echo 0)
   live_count=$(wc -l < "$LIVE_FILE"       2>/dev/null | tr -d ' ' || echo 0)
   total_urls=$(wc -l < "$ALL_URLS"        2>/dev/null | tr -d ' ' || echo 0)
   params_count=$(wc -l < "$PARAMS_FILE"   2>/dev/null | tr -d ' ' || echo 0)
   js_count=$(wc -l < "$JS_FILE"           2>/dev/null | tr -d ' ' || echo 0)
+  js_live_count=$(wc -l < "$JS_LIVE_FILE" 2>/dev/null | tr -d ' ' || echo 0)
   nuclei_count=$(wc -l < "$NUCLEI_FILE"   2>/dev/null | tr -d ' ' || echo 0)
 
   # Write to summary file
@@ -588,6 +653,7 @@ phase_summary() {
     echo "  Total URLs          : $total_urls"
     echo "  Parameterized URLs  : $params_count"
     echo "  JavaScript files    : $js_count"
+    echo "  Live JavaScript URLs: $js_live_count"
     echo "  Nuclei findings     : $nuclei_count"
     echo ""
     echo "  Output Files:"
@@ -601,6 +667,7 @@ phase_summary() {
     echo "  ├── params.txt        URLs with query parameters"
     echo "  ├── interesting.txt   Interesting endpoints"
     echo "  ├── js.txt            JavaScript file URLs"
+    echo "  ├── js_live.txt       Live JavaScript file URLs"
     echo "  ├── nuclei.txt        Nuclei scan findings"
     echo "  ├── summary.txt       This summary"
     echo "  └── recon.log         Full log of this run"
@@ -618,6 +685,7 @@ phase_summary() {
   echo -e "  ${CYAN}Total URLs         :${RESET} ${BOLD}$total_urls${RESET}"
   echo -e "  ${CYAN}Parameterized URLs :${RESET} ${BOLD}$params_count${RESET}"
   echo -e "  ${CYAN}JavaScript files   :${RESET} ${BOLD}$js_count${RESET}"
+  echo -e "  ${CYAN}Live JS URLs       :${RESET} ${BOLD}$js_live_count${RESET}"
   echo -e "  ${CYAN}Nuclei findings    :${RESET} ${BOLD}$nuclei_count${RESET}"
   echo ""
   echo -e "  ${GREEN}${BOLD}Output folder: $OUTPUT_DIR${RESET}"
@@ -659,6 +727,7 @@ main() {
   PARAMS_FILE="$OUTPUT_DIR/params.txt"
   INTERESTING_FILE="$OUTPUT_DIR/interesting.txt"
   JS_FILE="$OUTPUT_DIR/js.txt"
+  JS_LIVE_FILE="$OUTPUT_DIR/js_live.txt"
   NUCLEI_FILE="$OUTPUT_DIR/nuclei.txt"
   SUMMARY_FILE="$OUTPUT_DIR/summary.txt"
   LOG_FILE="$OUTPUT_DIR/recon.log"
@@ -681,10 +750,34 @@ main() {
   # Run all phases — each phase handles its own errors and continues gracefully
   phase_subdomains
   phase_live_hosts
+  prepare_live_urls
   phase_port_scan
-  phase_gau
-  phase_katana
-  phase_hakrawler
+
+  if [[ "$SEQUENTIAL_MODE" == true ]]; then
+    log_phase "Phase 4-6 — Sequential URL Collection & Crawling"
+    phase_gau
+    phase_katana
+    phase_hakrawler
+  else
+    log_phase "Phase 4-6 — Parallel URL Collection & Crawling"
+    # Background phase failures are handled in each phase (warn + fallback file).
+    # The ERR trap is intended for unexpected parent-shell failures.
+    phase_gau &
+    local gau_pid=$!
+    phase_katana &
+    local katana_pid=$!
+    phase_hakrawler &
+    local hakrawler_pid=$!
+    local parallel_failed=false
+    for pid in "$gau_pid" "$katana_pid" "$hakrawler_pid"; do
+      if ! wait "$pid"; then
+        parallel_failed=true
+      fi
+    done
+    if [[ "$parallel_failed" == true ]]; then
+      log_warn "One or more parallel phases exited non-zero. Continuing with available results."
+    fi
+  fi
   phase_url_analysis
   phase_nuclei
   phase_summary
